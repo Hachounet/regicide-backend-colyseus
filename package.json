@@ -10,7 +10,7 @@
   },
   "scripts": {
     "start": "node src/index.js",
-    "loadtest": "node loadtest/example.js --room my_room --numClients 2",
+    "loadtest": "node loadtest/example.js --room regicide --numClients 4",
     "test": "mocha test/**_test.js --exit --timeout 15000",
     "build": "exit 0"
   },

@@ -5,7 +5,7 @@ import { playground } from "@colyseus/playground";
 /**
  * Import your Room files
  */
-import { MyRoom } from "./rooms/MyRoom.js";
+import { RegicideRoom } from "./rooms/MyRoom.js";
 
 export default config({
 
@@ -13,7 +13,8 @@ export default config({
         /**
          * Define your room handlers:
          */
-        gameServer.define('my_room', MyRoom);
+        gameServer.define('regicide', RegicideRoom)
+            .filterBy(['playerCount', 'isPrivate', 'roomCode']);
     },
 
     initializeExpress: (app) => {
