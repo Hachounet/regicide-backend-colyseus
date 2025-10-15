@@ -112,10 +112,11 @@
 
 ```javascript
 {
-  readyCount: 2,
-  totalCount: 3,
-  minRequired: 3,
-  maxAllowed: 4
+  readyCount: 2,        // Nombre de joueurs prêts
+  totalCount: 3,        // Nombre de joueurs connectés actuellement
+  targetCount: 4,       // Nombre de joueurs requis pour cette room
+  minRequired: 3,       // Minimum absolu (global)
+  maxAllowed: 4         // Maximum absolu (global)
 }
 ```
 

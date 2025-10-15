@@ -131,21 +131,23 @@ export class RegicideRoom extends Room {
 
     const connectedPlayers = this.getConnectedPlayersCount();
     const readyPlayers = this.getReadyPlayersCount();
+    
+    // Récupérer le nombre de joueurs configuré pour cette room
+    const gameOptions = JSON.parse(this.state.gameOptions);
+    const targetPlayerCount = gameOptions.playerCount;
 
-    console.log(`Game start check: ${readyPlayers}/${connectedPlayers} players ready`);
+    console.log(`Game start check: ${readyPlayers}/${connectedPlayers} players ready (target: ${targetPlayerCount})`);
 
-    // Démarrer si 3-4 joueurs connectés et tous prêts
-    if (connectedPlayers >= this.minClients && 
-        connectedPlayers <= this.maxClients && 
-        readyPlayers === connectedPlayers) {
-      
-      console.log("All players ready! Starting game...");
+    // Démarrer uniquement si on a exactement le bon nombre de joueurs et tous sont prêts
+    if (connectedPlayers === targetPlayerCount && readyPlayers === connectedPlayers) {
+      console.log(`All ${targetPlayerCount} players ready! Starting game...`);
       this.startGame();
     } else {
       // Informer les joueurs du statut
       this.broadcast("waiting_for_players", {
         readyCount: readyPlayers,
         totalCount: connectedPlayers,
+        targetCount: targetPlayerCount,
         minRequired: this.minClients,
         maxAllowed: this.maxClients
       });

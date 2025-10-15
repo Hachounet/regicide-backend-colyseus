@@ -158,7 +158,8 @@ room.send("chat_message", {
 
 ```javascript
 room.onMessage("waiting_for_players", (data) => {
-  // data = { readyCount: 2, totalCount: 3, minRequired: 3, maxAllowed: 4 }
+  // data = { readyCount: 2, totalCount: 3, targetCount: 4, minRequired: 3, maxAllowed: 4 }
+  // targetCount = nombre de joueurs requis pour cette room spécifique
 });
 
 room.onMessage("player_ready_update", (data) => {
