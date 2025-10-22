@@ -2,9 +2,23 @@ import { Room } from "@colyseus/core";
 import { RegicideState } from "./schema/RegicideState.js";
 import { Player } from "./schema/Player.js";
 import { Pyramid } from "./schema/Pyramid.js";
+import { Card } from "./schema/Card.js";
 import { CardService } from "../services/CardService.js";
 import { GAME_PHASES, SUITS, CARD_TYPES, PYRAMID_STRUCTURE } from "../utils/GameConstants.js";
 import { ArraySchema } from "@colyseus/schema";
+// Logique modularisée
+import {
+  setupMessageHandlers as setupLobbyHandlers,
+  checkInactivity as lobbyCheckInactivity,
+  kickNotReadyPlayers as lobbyKickNotReadyPlayers
+} from "./logic/lobby.js";
+import {
+  setupCards as draftSetupCards,
+  startDraftPhase as draftStartDraftPhase,
+  handleDraftCards as draftHandleDraftCards,
+  skipToPlayingPhase as draftSkipToPlayingPhase
+} from "./logic/draft.js";
+import { handlePlayCard as gameplayHandlePlayCard, checkGameEnd, endGameAndCalculateScores, canPlayerPlay } from "./logic/gameplay.js";
 
 export class RegicideRoom extends Room {
   maxClients = 4;
@@ -14,8 +28,9 @@ export class RegicideRoom extends Room {
   // Variables pour le draft
   draftCards = [];        // Cartes disponibles pour le draft
   draftRound = 0;         // Tour de draft actuel
-  draftDirection = 1;     // Direction du passage des cartes
+  draftDirection = -1;    // Direction du passage des cartes (-1 = sens anti-horaire/vers la gauche, 1 = sens horaire/vers la droite)
   draftPacks = [];        // Paquets de cartes en cours de draft
+  pendingRemainingCards = new Map(); // Stockage temporaire des cartes restantes par joueur
 
   onCreate (options) {
     console.log("RegicideRoom created with options:", options);
@@ -32,11 +47,14 @@ export class RegicideRoom extends Room {
     this.state.createdAt = Date.now();
     this.state.lastActivity = Date.now();
 
-    // Messages handlers
-    this.setupMessageHandlers();
+  // Messages handlers
+  this.setupMessageHandlers();
 
     // Timer pour nettoyer les rooms inactives
-    this.setSimulationInterval(() => this.checkInactivity(), 30000); // 30s
+    this.setSimulationInterval(() => lobbyCheckInactivity(this), 30000); // 30s
+
+    // Timer pour retirer les joueurs non ready après 60s
+    this.setSimulationInterval(() => lobbyKickNotReadyPlayers(this), 5000); // vérif toutes les 5s
   }
 
   onJoin (client, options) {
@@ -51,6 +69,7 @@ export class RegicideRoom extends Room {
     player.score = 0;
     player.handCount = 0;
     player.hasPicked = false;
+    player.joinedAt = Date.now();
 
     // Ajouter à l'état
     this.state.players.push(player);
@@ -66,12 +85,13 @@ export class RegicideRoom extends Room {
     const playerIndex = this.state.players.findIndex(p => p.sessionId === client.sessionId);
     if (playerIndex !== -1) {
       if (this.state.phase === GAME_PHASES.WAITING) {
-        // En attente : supprimer le joueur
+        // En attente : retirer le joueur (ready ou non)
         this.state.players.splice(playerIndex, 1);
+        this.state.lastActivity = Date.now();
+        // On peut accepter un nouveau joueur à la place
       } else {
         // En jeu : marquer comme déconnecté
         this.state.players[playerIndex].isConnected = false;
-        
         // Vérifier si la partie peut continuer
         this.checkGameContinuation();
       }
@@ -87,38 +107,50 @@ export class RegicideRoom extends Room {
   // ==========================================
 
   setupMessageHandlers() {
-    // Joueur prêt à commencer
-    this.onMessage("player_ready", (client, message) => {
-      this.handlePlayerReady(client, message);
-    });
+    // Lobby (ready/not ready + chat)
+    setupLobbyHandlers(this);
 
-    // Joueur plus prêt (annuler ready)
-    this.onMessage("player_not_ready", (client, message) => {
-      this.handlePlayerNotReady(client, message);
-    });
-
-    // Jouer une carte
+    // Jouer une carte (gameplay)
     this.onMessage("play_card", (client, message) => {
-      this.handlePlayCard(client, message);
+      gameplayHandlePlayCard(this, client, message);
     });
 
-    // Utiliser un pouvoir spécial
+    // Utiliser un pouvoir spécial (placeholder)
     this.onMessage("use_special_power", (client, message) => {
       this.handleSpecialPower(client, message);
     });
 
     // Échange de cartes (draft)
     this.onMessage("draft_cards", (client, message) => {
-      this.handleDraftCards(client, message);
+      draftHandleDraftCards(this, client, message);
     });
 
-    // Chat/communication
-    this.onMessage("chat_message", (client, message) => {
-      this.broadcast("chat_message", {
-        from: this.getPlayerPseudo(client.sessionId),
-        message: message.text,
-        timestamp: Date.now()
-      });
+    // Passer son tour
+    this.onMessage("pass_turn", (client, message) => {
+      // Vérifier que la partie est en cours
+      if (this.state.phase !== GAME_PHASES.PLAYING) {
+        client.send("error", { code: "GAME_NOT_PLAYING", message: "La partie n'est pas en cours" });
+        return;
+      }
+      // Vérifier que c'est le tour du joueur
+      if (!this.isPlayerTurn(client.sessionId)) {
+        client.send("error", { code: "NOT_YOUR_TURN", message: "Ce n'est pas votre tour" });
+        return;
+      }
+      // Vérifier s'il ne peut vraiment rien jouer
+      const player = this.getPlayerBySessionId(client.sessionId);
+      if (!player) {
+        client.send("error", { code: "PLAYER_NOT_FOUND", message: "Joueur non trouvé" });
+        return;
+      }
+      if (canPlayerPlay(this, player)) {
+        client.send("error", { code: "CAN_STILL_PLAY", message: "Vous pouvez encore jouer une carte" });
+        return;
+      }
+      // Passer au joueur suivant
+      this.nextPlayer();
+      // Vérifier la fin de partie après le passage
+      checkGameEnd(this);
     });
   }
 
@@ -131,16 +163,14 @@ export class RegicideRoom extends Room {
 
     const connectedPlayers = this.getConnectedPlayersCount();
     const readyPlayers = this.getReadyPlayersCount();
-    
-    // Récupérer le nombre de joueurs configuré pour cette room
     const gameOptions = JSON.parse(this.state.gameOptions);
     const targetPlayerCount = gameOptions.playerCount;
 
-    console.log(`Game start check: ${readyPlayers}/${connectedPlayers} players ready (target: ${targetPlayerCount})`);
-
     // Démarrer uniquement si on a exactement le bon nombre de joueurs et tous sont prêts
     if (connectedPlayers === targetPlayerCount && readyPlayers === connectedPlayers) {
-      console.log(`All ${targetPlayerCount} players ready! Starting game...`);
+      // Randomiser le joueur de départ
+      this.state.currentPlayerIndex = Math.floor(Math.random() * this.state.players.length);
+      console.log(`Tous les joueurs sont prêts ! Joueur de départ randomisé : ${this.state.players[this.state.currentPlayerIndex].pseudo}`);
       this.startGame();
     } else {
       // Informer les joueurs du statut
@@ -153,18 +183,36 @@ export class RegicideRoom extends Room {
       });
     }
   }
+  // Timeout pour retirer les joueurs non ready après 60s
+  kickNotReadyPlayers() {
+    if (this.state.phase !== GAME_PHASES.WAITING) return;
+    const now = Date.now();
+    // On retire les joueurs non ready depuis plus de 60s
+    this.state.players = this.state.players.filter(player => {
+      if (!player.isReady && now - player.joinedAt > 60000) {
+        console.log(`Joueur ${player.pseudo} retiré pour inactivité (non ready > 60s)`);
+        return false;
+      }
+      return true;
+    });
+  }
 
   startGame() {
     console.log("Starting Regicide game with", this.state.players.length, "players");
     
-    this.state.phase = GAME_PHASES.DRAFTING;
-    this.state.turn = 1;
+  // Créer et distribuer les cartes
+  draftSetupCards(this);
     
-    // Créer et distribuer les cartes
-    this.setupCards();
-    
-    // Démarrer le draft
-    this.startDraftPhase();
+    // Mode debug : skip draft et aller directement au jeu
+    if (this.skipDraft) {
+      console.log("DEBUG MODE: Skipping draft phase, going directly to PLAYING");
+      draftSkipToPlayingPhase(this);
+    } else {
+      this.state.phase = GAME_PHASES.DRAFTING;
+      this.state.turn = 1;
+      // Démarrer le draft
+      draftStartDraftPhase(this);
+    }
   }
 
   checkGameContinuation() {
@@ -177,13 +225,8 @@ export class RegicideRoom extends Room {
   }
 
   checkInactivity() {
-    const inactiveTime = Date.now() - this.state.lastActivity;
-    const maxInactiveTime = 30 * 60 * 1000; // 30 minutes
-
-    if (inactiveTime > maxInactiveTime && this.state.phase === GAME_PHASES.WAITING) {
-      console.log("Room inactive, disposing...");
-      this.disconnect();
-    }
+    // délégué au module lobby (timer déjà branché), conservé pour compat
+    // laissé vide intentionnellement
   }
 
   // ==========================================
@@ -242,7 +285,7 @@ export class RegicideRoom extends Room {
     // 6. Stocker les cartes pour le draft
     this.draftCards = shuffledCards;
     this.draftRound = 1;
-    this.draftDirection = 1; // 1 = vers la gauche, -1 = vers la droite
+    this.draftDirection = -1; // -1 = vers la gauche, 1 = vers la droite
     
     console.log("Cards setup complete. Draft cards ready:", shuffledCards.length);
   }
@@ -251,13 +294,17 @@ export class RegicideRoom extends Room {
     const playerCount = this.state.players.length;
     const shuffledKings = CardService.shuffleDeck([...kings]);
     
-    // Distribuer les rois
+    // Distribuer les rois directement dans les mains des joueurs
     this.state.players.forEach((player, index) => {
       const king = shuffledKings[index];
       king.isVisible = false; // Masquer le roi secret
       player.secretKing = king;
       
-      console.log(`${player.pseudo} received secret king of ${king.suit}`);
+      // Ajouter le roi directement dans la main du joueur
+      player.hand.push(king);
+      player.handCount = player.hand.length;
+      
+      console.log(`${player.pseudo} received secret king of ${king.suit} (added to hand)`);
     });
     
     // Pour 3 joueurs : marquer la famille non utilisée
@@ -274,18 +321,30 @@ export class RegicideRoom extends Room {
   initializePyramid() {
     this.state.pyramid = new Pyramid();
     
-    // Remplir avec des emplacements vides (null)
+    // Remplir avec des emplacements vides (Card avec isEmpty=true)
     for (let i = 0; i < PYRAMID_STRUCTURE.ROW1; i++) {
-      this.state.pyramid.row1.push(null);
+      const emptyCard = new Card();
+      emptyCard.isEmpty = true;
+      emptyCard.id = `empty_${i}`;
+      this.state.pyramid.row1.push(emptyCard);
     }
     for (let i = 0; i < PYRAMID_STRUCTURE.ROW2; i++) {
-      this.state.pyramid.row2.push(null);
+      const emptyCard = new Card();
+      emptyCard.isEmpty = true;
+      emptyCard.id = `empty_r2_${i}`;
+      this.state.pyramid.row2.push(emptyCard);
     }
     for (let i = 0; i < PYRAMID_STRUCTURE.ROW3; i++) {
-      this.state.pyramid.row3.push(null);
+      const emptyCard = new Card();
+      emptyCard.isEmpty = true;
+      emptyCard.id = `empty_r3_${i}`;
+      this.state.pyramid.row3.push(emptyCard);
     }
     for (let i = 0; i < PYRAMID_STRUCTURE.ROW4; i++) {
-      this.state.pyramid.row4.push(null);
+      const emptyCard = new Card();
+      emptyCard.isEmpty = true;
+      emptyCard.id = `empty_r4_${i}`;
+      this.state.pyramid.row4.push(emptyCard);
     }
     
     this.state.pyramid.totalCards = 0;
@@ -632,7 +691,7 @@ export class RegicideRoom extends Room {
   processDraftSelection(player, selectedCards, playerPack) {
     console.log(`${player.pseudo} picked ${selectedCards.length} cards`);
     
-    // Ajouter les cartes choisies à la main du joueur
+    // Ajouter les cartes choisies directement à la main définitive du joueur
     selectedCards.forEach(card => {
       player.hand.push(card);
     });
@@ -642,6 +701,9 @@ export class RegicideRoom extends Room {
       !selectedCards.some(selected => selected.id === card.id)
     );
     
+    // Stocker les cartes restantes temporairement
+    this.pendingRemainingCards.set(player.sessionId, remainingCards);
+    
     // Marquer le joueur comme ayant choisi
     player.hasPicked = true;
     player.handCount = player.hand.length;
@@ -649,19 +711,121 @@ export class RegicideRoom extends Room {
     // Vider le paquet de draft du joueur
     player.draftPack.clear();
     
-    console.log(`${player.pseudo} now has ${player.hand.length} cards, ${remainingCards.length} cards remaining in pack`);
-    
-    // Passer le paquet restant au voisin de gauche (si il reste des cartes)
-    if (remainingCards.length > 0) {
-      this.passDraftPack(player, remainingCards);
-    }
+    console.log(`${player.pseudo} now has ${player.hand.length} cards in final hand, ${remainingCards.length} cards pending redistribution`);
     
     // Vérifier si tous les joueurs ont choisi leurs cartes pour ce tour
-    this.checkDraftRoundComplete();
+    this.checkAllPlayersHavePicked();
+  }
+
+  checkAllPlayersHavePicked() {
+    // Vérifier si tous les joueurs connectés qui ont des cartes à drafter ont choisi
+    const connectedPlayers = this.state.players.filter(p => p.isConnected);
+    const playersWithDraftPacks = connectedPlayers.filter(p => p.draftPack.length > 0);
+    const playersWhoNeedToPick = playersWithDraftPacks.filter(p => !p.hasPicked);
+    const playersWithPendingCards = this.pendingRemainingCards.size;
+    
+    console.log(`Pick check: ${playersWhoNeedToPick.length} players still need to pick from ${playersWithDraftPacks.length} players with cards`);
+    console.log(`Players with packs: ${playersWithDraftPacks.map(p => p.pseudo).join(', ')}`);
+    console.log(`Players who need to pick: ${playersWhoNeedToPick.map(p => p.pseudo).join(', ')}`);
+    console.log(`Players with pending cards: ${playersWithPendingCards}`);
+    
+    // Si tous les joueurs qui avaient des cartes ont choisi ET qu'il y a des cartes en attente
+    if (playersWhoNeedToPick.length === 0 && playersWithPendingCards > 0) {
+      console.log("All players have picked and there are pending cards! Redistributing...");
+      this.redistributeRemainingCards();
+      return; // Important: ne pas vérifier la fin du round ici
+    }
+    
+    // Si personne n'a plus de cartes à drafter ET aucune carte en attente, vérifier si le round est terminé
+    if (playersWithDraftPacks.length === 0 && playersWithPendingCards === 0) {
+      console.log("No more cards anywhere, checking if round is complete...");
+      this.checkDraftRoundComplete();
+    }
+  }
+
+  redistributeRemainingCards() {
+    console.log("Redistributing cards based on pending selections...");
+    
+    const connectedPlayers = this.state.players.filter(p => p.isConnected);
+    
+    // Vérifier que tous les joueurs connectés ont bien leurs cartes en attente
+    const playersWithPendingCards = connectedPlayers.filter(p => 
+      this.pendingRemainingCards.has(p.sessionId)
+    );
+    
+    console.log(`Players with pending cards: ${playersWithPendingCards.length}/${connectedPlayers.length}`);
+    
+    // Ne redistribuer que si tous les joueurs connectés ont des cartes en attente
+    if (playersWithPendingCards.length !== connectedPlayers.length) {
+      console.log("Not all players have pending cards yet, waiting...");
+      return;
+    }
+    
+    let cardsRedistributed = false;
+    
+    // Redistribuer les cartes restantes selon la direction du draft
+    connectedPlayers.forEach((player, index) => {
+      const remainingCards = this.pendingRemainingCards.get(player.sessionId);
+      
+      console.log(`Processing player ${player.pseudo} (index ${index})`);
+      
+      if (remainingCards && remainingCards.length > 0) {
+        cardsRedistributed = true;
+        
+        // Calculer le joueur suivant selon la direction
+        // Direction -1 = vers la gauche (index précédent)
+        // Direction 1 = vers la droite (index suivant)
+        const nextPlayerIndex = (index + this.draftDirection + connectedPlayers.length) % connectedPlayers.length;
+        const nextPlayer = connectedPlayers[nextPlayerIndex];
+        
+        console.log(`Player order for redistribution:`);
+        connectedPlayers.forEach((p, i) => {
+          console.log(`  Index ${i}: ${p.pseudo} (${p.sessionId})`);
+        });
+        console.log(`${player.pseudo} (index ${index}) gives cards to ${nextPlayer.pseudo} (index ${nextPlayerIndex})`);
+        console.log(`Direction: ${this.draftDirection}, calculation: (${index} + ${this.draftDirection} + ${connectedPlayers.length}) % ${connectedPlayers.length} = ${nextPlayerIndex}`);
+        
+        // Donner les cartes restantes au joueur suivant
+        if (!nextPlayer.draftPack) {
+          nextPlayer.draftPack = new ArraySchema();
+        }
+        
+        nextPlayer.draftPack.clear();
+        remainingCards.forEach(card => {
+          nextPlayer.draftPack.push(card);
+        });
+        
+        // Réinitialiser le statut du joueur suivant
+        nextPlayer.hasPicked = false;
+        
+        console.log(`Redistributed ${remainingCards.length} cards from ${player.pseudo} to ${nextPlayer.pseudo}`);
+        
+        // Notifier le joueur suivant
+        const nextClient = this.clients.find(c => c.sessionId === nextPlayer.sessionId);
+        if (nextClient) {
+          nextClient.send("draft_pack_received", {
+            round: this.draftRound,
+            cardsCount: remainingCards.length,
+            pickCount: this.getExpectedPickCount(this.state.players.length, remainingCards.length === 4)
+          });
+        }
+      }
+    });
+    
+    // Nettoyer les cartes en attente
+    this.pendingRemainingCards.clear();
+    
+    if (cardsRedistributed) {
+      console.log("Redistribution complete, players can now pick again");
+    } else {
+      console.log("No cards to redistribute, checking if round is complete");
+      this.checkDraftRoundComplete();
+    }
   }
 
   passDraftPack(fromPlayer, remainingCards) {
     const playerIndex = this.state.players.findIndex(p => p.sessionId === fromPlayer.sessionId);
+    // Direction -1 = vers la gauche (index précédent), Direction 1 = vers la droite (index suivant)
     const nextPlayerIndex = (playerIndex + this.draftDirection + this.state.players.length) % this.state.players.length;
     const nextPlayer = this.state.players[nextPlayerIndex];
     
@@ -696,11 +860,21 @@ export class RegicideRoom extends Room {
     const playersWithCards = this.state.players.filter(p => p.draftPack.length > 0);
     const playersWhoCanPick = this.state.players.filter(p => p.draftPack.length > 0 && !p.hasPicked);
     
-    console.log(`Draft check: ${playersWithCards.length} players with cards, ${playersWhoCanPick.length} can still pick`);
+    console.log(`Draft round check: ${playersWithCards.length} players with cards, ${playersWhoCanPick.length} can still pick`);
     
-    if (playersWhoCanPick.length === 0) {
-      // Tour de draft terminé
+    // Le round n'est terminé que si :
+    // 1. Plus personne n'a de cartes ET
+    // 2. Plus personne n'a de cartes en attente de redistribution
+    const playersWithPendingCards = this.pendingRemainingCards.size;
+    
+    console.log(`Pending cards from ${playersWithPendingCards} players`);
+    
+    if (playersWithCards.length === 0 && playersWithPendingCards === 0) {
+      // Maintenant le tour de draft est vraiment terminé
+      console.log("Draft round truly complete - no cards left anywhere");
       this.completeDraftRound();
+    } else {
+      console.log("Draft round continues - cards still in circulation");
     }
   }
 
@@ -713,6 +887,9 @@ export class RegicideRoom extends Room {
       player.draftPack.clear();
     });
     
+    // Nettoyer les cartes en attente de redistribution
+    this.pendingRemainingCards.clear();
+    
     // Vérifier si le draft est terminé
     if (this.isDraftComplete()) {
       this.finalizeDraft();
@@ -724,15 +901,24 @@ export class RegicideRoom extends Room {
 
   isDraftComplete() {
     const playerCount = this.state.players.length;
-    const targetHandSize = 12; // 12 cartes par joueur (sans compter le roi)
+    const targetHandSize = 13; // 12 cartes draftées + 1 roi = 13 cartes total
     
-    // Vérifier si tous les joueurs ont 12 cartes
+    console.log(`Draft completion check:`);
+    this.state.players.forEach(player => {
+      console.log(`  ${player.pseudo}: ${player.hand.length} cards (target: ${targetHandSize})`);
+    });
+    console.log(`  Cards remaining in deck: ${this.draftCards.length}`);
+    
+    // Vérifier si tous les joueurs ont 13 cartes (12 draftées + 1 roi)
     const allPlayersHaveEnoughCards = this.state.players.every(player => 
       player.hand.length >= targetHandSize
     );
     
-    // Ou si on n'a plus de cartes à distribuer
-    const noMoreCards = this.draftCards.length === 0;
+    // Ou si on n'a plus de cartes à distribuer ET qu'on ne peut plus faire de paquets complets
+    const noMoreCards = this.draftCards.length < (playerCount * 4);
+    
+    console.log(`  All players have enough cards: ${allPlayersHaveEnoughCards}`);
+    console.log(`  No more cards for complete packs: ${noMoreCards}`);
     
     return allPlayersHaveEnoughCards || noMoreCards;
   }
@@ -753,15 +939,11 @@ export class RegicideRoom extends Room {
   }
 
   finalizeDraft() {
-    console.log("Draft phase complete! Adding secret kings to hands...");
+    console.log("Draft phase complete! All players have their full hands...");
     
-    // Ajouter les rois secrets aux mains des joueurs
+    // Afficher les mains finales
     this.state.players.forEach(player => {
-      if (player.secretKing) {
-        player.hand.push(player.secretKing);
-        player.handCount = player.hand.length;
-        console.log(`${player.pseudo} final hand: ${player.hand.length} cards (including secret king)`);
-      }
+      console.log(`${player.pseudo} final hand: ${player.hand.length} cards (including secret king)`);
     });
     
     // Passer à la phase de jeu
@@ -778,6 +960,43 @@ export class RegicideRoom extends Room {
     });
     
     console.log("Game phase started! Current player:", this.state.players[0].pseudo);
+  }
+
+  // Mode debug : skip draft et distribuer des cartes aléatoires
+  skipToPlayingPhase() {
+    console.log("DEBUG MODE: Skipping to playing phase with random hands");
+    
+    // Distribuer 12 cartes aléatoires à chaque joueur (en plus du roi secret)
+    this.state.players.forEach(player => {
+      const cardsToAdd = 12;
+      for (let i = 0; i < cardsToAdd && this.draftCards.length > 0; i++) {
+        const randomIndex = Math.floor(Math.random() * this.draftCards.length);
+        const card = this.draftCards.splice(randomIndex, 1)[0];
+        player.hand.push(card);
+      }
+      player.handCount = player.hand.length;
+      console.log(`DEBUG: ${player.pseudo} has ${player.hand.length} cards (including secret king)`);
+    });
+    
+    // Passer directement à la phase de jeu
+    this.state.phase = GAME_PHASES.PLAYING;
+    this.state.currentPlayerIndex = 0;
+    this.state.turn = 1;
+    
+    // Initialiser la défausse
+    this.state.discardPile = new ArraySchema();
+    
+    // Notifier tous les joueurs
+    if (this.state.players.length > 0) {
+      this.broadcast("draft_complete", {
+        message: "DEBUG MODE: Phase de draft sautée, la partie commence !",
+        currentPlayer: this.state.players[0].sessionId
+      });
+      
+      console.log("DEBUG: Game phase started! Current player:", this.state.players[0].pseudo);
+    } else {
+      console.log("DEBUG: No players available for game start notification");
+    }
   }
 
   // ==========================================
@@ -799,7 +1018,8 @@ export class RegicideRoom extends Room {
     const rowArray = this.getPyramidRow(row);
     if (!rowArray || col < 0 || col >= rowArray.length) return false;
     
-    const wasEmpty = !rowArray[col];
+    const existingCard = rowArray[col];
+    const wasEmpty = !existingCard || existingCard.isEmpty;
     rowArray[col] = card;
     
     // Mettre à jour la position de la carte
@@ -832,7 +1052,15 @@ export class RegicideRoom extends Room {
 
   isValidPosition(row, col) {
     const rowArray = this.getPyramidRow(row);
-    return rowArray && col >= 0 && col < rowArray.length;
+    
+    if (!rowArray || col < 0 || col >= rowArray.length) {
+      return false;
+    }
+    
+    // Vérifier si l'emplacement est vide (carte avec isEmpty=true)
+    const cardAtPosition = rowArray[col];
+    const isEmpty = cardAtPosition && cardAtPosition.isEmpty;
+    return isEmpty;
   }
 
   // ==========================================
@@ -851,9 +1079,9 @@ export class RegicideRoom extends Room {
       return false;
     }
 
-    // Vérifier que l'emplacement est vide
+    // Vérifier que l'emplacement est vide (pas de carte ou carte vide)
     const existingCard = this.getCardAt(row, col);
-    if (existingCard) {
+    if (existingCard && !existingCard.isEmpty) {
       player.sessionId && this.clients.find(c => c.sessionId === player.sessionId)?.send("error", {
         code: "POSITION_OCCUPIED",
         message: "Cet emplacement est déjà occupé"
@@ -892,65 +1120,63 @@ export class RegicideRoom extends Room {
   }
 
   canPlaceCardAt(card, row, col) {
-    // Rangée 1 (base) : placement libre
+    // Row 1 (base) : placement libre sur emplacement vide
     if (row === 1) {
       return true;
     }
-
-    // Rangées 2-4 : doit avoir un support de la même famille
+    // Rows supérieurs : support requis UNIQUEMENT lors du placement sur un emplacement vide
     const leftSupportCol = col;
     const rightSupportCol = col + 1;
-    
     const leftSupport = this.getCardAt(row - 1, leftSupportCol);
     const rightSupport = this.getCardAt(row - 1, rightSupportCol);
-
-    // Au moins un support doit être de la même famille
-    const hasValidSupport = 
-      (leftSupport && leftSupport.suit === card.suit) ||
-      (rightSupport && rightSupport.suit === card.suit);
-
+    const hasValidSupport =
+      (leftSupport && !leftSupport.isEmpty && leftSupport.suit === card.suit) ||
+      (rightSupport && !rightSupport.isEmpty && rightSupport.suit === card.suit);
     return hasValidSupport;
   }
 
   handleReplaceCard(card, target, player) {
     const { row, col } = target;
-    
-    // Vérifier que la position est valide
-    if (!this.isValidPosition(row, col)) {
+    // Vérifier que la position existe dans la pyramide
+    const rowArray = this.getPyramidRow(row);
+    if (!rowArray || col < 0 || col >= rowArray.length) {
       player.sessionId && this.clients.find(c => c.sessionId === player.sessionId)?.send("error", {
         code: "INVALID_POSITION",
         message: "Position invalide sur la pyramide"
       });
       return false;
     }
-
-    // Vérifier qu'il y a une carte à remplacer
+    // Vérifier qu'il y a une carte à remplacer (et qu'elle n'est pas vide)
     const existingCard = this.getCardAt(row, col);
-    if (!existingCard) {
+    if (!existingCard || existingCard.isEmpty) {
       player.sessionId && this.clients.find(c => c.sessionId === player.sessionId)?.send("error", {
         code: "NO_CARD_TO_REPLACE",
         message: "Aucune carte à remplacer à cette position"
       });
       return false;
     }
-
-    // Vérifier que le remplacement est autorisé selon la hiérarchie
-    if (!CardService.canReplaceCard(card, existingCard)) {
+    // Remplacement :
+    // Row 1 : juste vérifier que la valeur de la carte est égale ou supérieure
+    if (row === 1 && card.value < existingCard.value) {
+      player.sessionId && this.clients.find(c => c.sessionId === player.sessionId)?.send("error", {
+        code: "CANNOT_REPLACE_CARD",
+        message: "La valeur doit être égale ou supérieure pour remplacer sur la base"
+      });
+      return false;
+    }
+    // Vérifier que le remplacement est autorisé selon la hiérarchie (autres rows)
+    if (row > 1 && !CardService.canReplaceCard(card, existingCard)) {
       player.sessionId && this.clients.find(c => c.sessionId === player.sessionId)?.send("error", {
         code: "CANNOT_REPLACE_CARD",
         message: "Cette carte ne peut pas remplacer la carte existante"
       });
       return false;
     }
-
     // Ajouter la carte remplacée à la défausse
     this.state.discardPile.push(existingCard);
-    
     // Placer la nouvelle carte
     this.setCardAt(row, col, card);
-    
     console.log(`${player.pseudo} replaced ${existingCard.value} of ${existingCard.suit} with ${card.value} of ${card.suit} at (${row},${col})`);
-    
     // Notifier tous les joueurs
     this.broadcast("card_replaced", {
       playerSessionId: player.sessionId,
@@ -969,7 +1195,6 @@ export class RegicideRoom extends Room {
       },
       position: { row, col }
     });
-
     return true;
   }
 
@@ -1026,39 +1251,34 @@ export class RegicideRoom extends Room {
       });
       return false;
     }
-
     const pos1 = target.exchangeTargets[0];
     const pos2 = target.exchangeTargets[1];
-
     const card1 = this.getCardAt(pos1.row, pos1.col);
     const card2 = this.getCardAt(pos2.row, pos2.col);
-
-    if (!card1 || !card2) {
+    // Vérifier que les deux cartes existent et ne sont pas vides
+    if (!card1 || !card2 || card1.isEmpty || card2.isEmpty) {
       player.sessionId && this.clients.find(c => c.sessionId === player.sessionId)?.send("error", {
         code: "INVALID_EXCHANGE_CARDS",
-        message: "Les deux positions doivent contenir des cartes"
+        message: "Les deux positions doivent contenir des cartes valides"
       });
       return false;
     }
-
-    // Échanger les cartes
+    // On n'échange pas la Dame elle-même
+    // Échanger les cartes (pas de vérification de support, pas de redéclenchement de pouvoirs)
     this.setCardAt(pos1.row, pos1.col, card2);
     this.setCardAt(pos2.row, pos2.col, card1);
-
-    console.log(`${player.pseudo} used Queen power: exchanged cards at (${pos1.row},${pos1.col}) and (${pos2.row},${pos2.col})`);
-
+    console.log(`${player.pseudo} used Queen power: exchanged ${card1.value} of ${card1.suit} at (${pos1.row},${pos1.col}) with ${card2.value} of ${card2.suit} at (${pos2.row},${pos2.col})`);
     // Notifier tous les joueurs
     this.broadcast("queen_power_used", {
       playerSessionId: player.sessionId,
       pseudo: player.pseudo,
       exchangedPositions: [pos1, pos2]
     });
-
     return true;
   }
 
   handleJackPower(target, player) {
-    // Valet : Donner une carte à un autre joueur et en piocher une dans sa main au hasard
+    // Valet : Fonctionnement précis
     if (!target.giveCardId || !target.targetPlayerId) {
       player.sessionId && this.clients.find(c => c.sessionId === player.sessionId)?.send("error", {
         code: "INVALID_JACK_TARGETS",
@@ -1066,7 +1286,6 @@ export class RegicideRoom extends Room {
       });
       return false;
     }
-
     const targetPlayer = this.getPlayerBySessionId(target.targetPlayerId);
     if (!targetPlayer) {
       player.sessionId && this.clients.find(c => c.sessionId === player.sessionId)?.send("error", {
@@ -1075,7 +1294,6 @@ export class RegicideRoom extends Room {
       });
       return false;
     }
-
     const cardToGive = player.hand.find(c => c.id === target.giveCardId);
     if (!cardToGive) {
       player.sessionId && this.clients.find(c => c.sessionId === player.sessionId)?.send("error", {
@@ -1084,7 +1302,6 @@ export class RegicideRoom extends Room {
       });
       return false;
     }
-
     if (targetPlayer.hand.length === 0) {
       player.sessionId && this.clients.find(c => c.sessionId === player.sessionId)?.send("error", {
         code: "TARGET_HAND_EMPTY",
@@ -1092,26 +1309,28 @@ export class RegicideRoom extends Room {
       });
       return false;
     }
-
-    // Retirer la carte de la main du joueur actuel
+    // Retirer la carte à donner de la main du joueur A
     const cardIndex = player.hand.findIndex(c => c.id === target.giveCardId);
     player.hand.splice(cardIndex, 1);
-
-    // Piocher une carte au hasard de la main du joueur cible
-    const randomIndex = Math.floor(Math.random() * targetPlayer.hand.length);
-    const receivedCard = targetPlayer.hand[randomIndex];
-    targetPlayer.hand.splice(randomIndex, 1);
-
-    // Échanger les cartes
+    // Ajouter la carte à la main du joueur B
     targetPlayer.hand.push(cardToGive);
+    // Piocher une carte au hasard dans la main du joueur B (qui ne peut pas être celle qui vient d'être reçue)
+    const possibleCards = targetPlayer.hand.filter(c => c.id !== cardToGive.id);
+    if (possibleCards.length === 0) {
+      // Si B n'a plus que la carte reçue, rien à échanger
+      return true;
+    }
+    const randomIndex = Math.floor(Math.random() * possibleCards.length);
+    const receivedCard = possibleCards[randomIndex];
+    // Retirer la carte au hasard de la main de B
+    const receivedCardIndex = targetPlayer.hand.findIndex(c => c.id === receivedCard.id);
+    targetPlayer.hand.splice(receivedCardIndex, 1);
+    // Ajouter la carte à la main du joueur A
     player.hand.push(receivedCard);
-
     // Mettre à jour les compteurs
     player.handCount = player.hand.length;
     targetPlayer.handCount = targetPlayer.hand.length;
-
     console.log(`${player.pseudo} used Jack power: gave card to ${targetPlayer.pseudo} and received a random card`);
-
     // Notifier tous les joueurs
     this.broadcast("jack_power_used", {
       playerSessionId: player.sessionId,
@@ -1119,7 +1338,6 @@ export class RegicideRoom extends Room {
       targetPlayerSessionId: targetPlayer.sessionId,
       targetPseudo: targetPlayer.pseudo
     });
-
     return true;
   }
 
@@ -1140,8 +1358,8 @@ export class RegicideRoom extends Room {
     // Mettre à jour l'activité
     this.state.lastActivity = Date.now();
 
-    // Vérifier les conditions de fin de partie
-    if (this.checkGameEnd()) {
+    // Vérifier les conditions de fin de partie (sauf en mode test)
+    if (!this.testMode && checkGameEnd(this)) {
       return; // Partie terminée
     }
 
@@ -1177,126 +1395,8 @@ export class RegicideRoom extends Room {
     });
   }
 
-  checkGameEnd() {
-    // 1. Vérifier si tous les joueurs ont vidé leur main
-    const allHandsEmpty = this.state.players.every(p => p.hand.length === 0);
-    
-    if (allHandsEmpty) {
-      console.log("Game ending: all players have empty hands");
-      this.endGameAndCalculateScores();
-      return true;
-    }
-
-    // 2. Vérifier si un seul joueur peut encore jouer
-    const playersWhoCanPlay = this.state.players.filter(p => 
-      p.isConnected && p.hand.length > 0 && this.canPlayerPlay(p)
-    );
-
-    if (playersWhoCanPlay.length <= 1) {
-      console.log("Game ending: only one player can play");
-      this.endGameAndCalculateScores();
-      return true;
-    }
-
-    return false;
-  }
-
-  canPlayerPlay(player) {
-    // Vérifier si le joueur a au moins une carte jouable
-    return player.hand.some(card => {
-      // Vérifier s'il peut placer la carte quelque part
-      for (let row = 1; row <= 4; row++) {
-        const rowArray = this.getPyramidRow(row);
-        if (!rowArray) continue;
-        
-        for (let col = 0; col < rowArray.length; col++) {
-          const existingCard = this.getCardAt(row, col);
-          
-          // Peut placer sur emplacement vide
-          if (!existingCard && this.canPlaceCardAt(card, row, col)) {
-            return true;
-          }
-          
-          // Peut remplacer une carte existante
-          if (existingCard && CardService.canReplaceCard(card, existingCard)) {
-            return true;
-          }
-        }
-      }
-      return false;
-    });
-  }
-
-  endGameAndCalculateScores() {
-    console.log("Calculating final scores...");
-    
-    // Calculer les scores de chaque joueur
-    this.state.players.forEach(player => {
-      player.score = this.calculatePlayerScore(player);
-      console.log(`${player.pseudo} final score: ${player.score}`);
-    });
-
-    // Déterminer le gagnant
-    const winner = this.state.players.reduce((prev, current) => 
-      (prev.score > current.score) ? prev : current
-    );
-
-    this.state.winner = winner.sessionId;
-    this.state.phase = GAME_PHASES.FINISHED;
-
-    console.log(`Game finished! Winner: ${winner.pseudo} with ${winner.score} points`);
-
-    // Notifier tous les joueurs
-    this.broadcast("game_finished", {
-      winner: {
-        sessionId: winner.sessionId,
-        pseudo: winner.pseudo,
-        score: winner.score
-      },
-      finalScores: this.state.players.map(p => ({
-        sessionId: p.sessionId,
-        pseudo: p.pseudo,
-        score: p.score,
-        secretKing: {
-          suit: p.secretKing.suit,
-          value: p.secretKing.value
-        }
-      }))
-    });
-  }
-
-  calculatePlayerScore(player) {
-    if (!player.secretKing) return 0;
-
-    const playerSuit = player.secretKing.suit;
-    let totalScore = 0;
-
-    // Parcourir toute la pyramide et compter les points
-    for (let row = 1; row <= 4; row++) {
-      const rowArray = this.getPyramidRow(row);
-      if (!rowArray) continue;
-
-      const multiplier = row; // Row 1 = ×1, Row 2 = ×2, etc.
-
-      for (let col = 0; col < rowArray.length; col++) {
-        const card = this.getCardAt(row, col);
-        
-        if (card && card.suit === playerSuit) {
-          // Ajouter la valeur de la carte × multiplicateur de rangée
-          totalScore += card.value * multiplier;
-        }
-      }
-    }
-
-    // Pour 3 joueurs : vérifier la famille exclue
-    const gameOptions = JSON.parse(this.state.gameOptions);
-    if (gameOptions.excludedSuit === playerSuit) {
-      console.log(`${player.pseudo}'s suit (${playerSuit}) is excluded in 3-player game`);
-      return 0;
-    }
-
-    return totalScore;
-  }
+  // Les fonctions checkGameEnd, canPlayerPlay, endGameAndCalculateScores et calculatePlayerScore
+  // sont maintenant importées depuis gameplay.js pour éviter la duplication de code
 
   endGame(reason) {
     this.state.phase = GAME_PHASES.FINISHED;

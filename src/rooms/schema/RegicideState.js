@@ -16,6 +16,8 @@ export class RegicideState extends Schema {
     this.phase = "waiting";           // "waiting", "drafting", "playing", "finished"
     this.currentPlayerIndex = 0;
     this.turn = 0;
+    this.draftRound = 0;
+    this.totalDraftRounds = 0;
     this.gameOptions = "{}";     // JSON string pour les options
     this.winner = "";          // sessionId du gagnant
     this.createdAt = 0;
@@ -37,6 +39,8 @@ defineTypes(RegicideState, {
   
   // Métadonnées
   turn: "number",
+  draftRound: "number",
+  totalDraftRounds: "number",
   gameOptions: "string",     // JSON string pour les options
   winner: "string",          // sessionId du gagnant
   

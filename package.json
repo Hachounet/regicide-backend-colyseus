@@ -23,6 +23,7 @@
   "devDependencies": {
     "@colyseus/loadtest": "^0.16.0",
     "@colyseus/testing": "^0.16.0",
+    "chai": "^6.2.0",
     "mocha": "^10.2.0",
     "rimraf": "^5.0.0"
   },

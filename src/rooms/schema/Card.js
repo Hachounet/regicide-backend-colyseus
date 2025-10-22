@@ -20,5 +20,6 @@ defineTypes(Card, {
   type: "string",       // "ace", "number", "jack", "queen", "king"
   row: "number",        // Position pyramide (0 = pas placée)
   col: "number",
-  isVisible: "boolean"  // Pour masquer les rois secrets
+  isVisible: "boolean", // Pour masquer les rois secrets
+  isEmpty: "boolean"    // Pour marquer les emplacements vides
 });

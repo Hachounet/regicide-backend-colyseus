@@ -46,7 +46,18 @@ export class CardService {
   }
   
   static canReplaceCard(newCard, existingCard) {
+    // Validation des paramètres
+    if (!newCard || !existingCard || !newCard.type || !existingCard.type) {
+      return false;
+    }
+    
     const { ACE, NUMBER, JACK, QUEEN, KING } = CARD_TYPES;
+    
+    // Validation des types de cartes valides
+    const validTypes = [ACE, NUMBER, JACK, QUEEN, KING];
+    if (!validTypes.includes(newCard.type) || !validTypes.includes(existingCard.type)) {
+      return false;
+    }
     
     // Cas spécial : As peut remplacer Valet/Dame/Roi (cycle des règles)
     if (newCard.type === ACE && [JACK, QUEEN, KING].includes(existingCard.type)) {
