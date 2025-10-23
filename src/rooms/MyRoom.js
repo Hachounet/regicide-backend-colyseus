@@ -35,6 +35,13 @@ export class RegicideRoom extends Room {
   onCreate (options) {
     console.log("RegicideRoom created with options:", options);
     
+    // Définir les métadonnées pour le filtrage des rooms
+    this.setMetadata({
+      playerCount: options.playerCount || 4,
+      isPrivate: options.isPrivate || false,
+      roomCode: options.roomCode || null
+    });
+    
     // Initialiser l'état du jeu
     this.state.phase = GAME_PHASES.WAITING;
     this.state.currentPlayerIndex = 0;
