@@ -35,9 +35,13 @@ export class RegicideRoom extends Room {
   onCreate (options) {
     console.log("RegicideRoom created with options:", options);
     
+    // Configurer maxClients selon le nombre de joueurs demandé
+    const targetPlayerCount = options.playerCount || 4;
+    this.maxClients = targetPlayerCount;
+    
     // Définir les métadonnées pour le filtrage des rooms
     this.setMetadata({
-      playerCount: options.playerCount || 4,
+      playerCount: targetPlayerCount,
       isPrivate: options.isPrivate || false,
       roomCode: options.roomCode || null
     });
@@ -47,7 +51,7 @@ export class RegicideRoom extends Room {
     this.state.currentPlayerIndex = 0;
     this.state.turn = 0;
     this.state.gameOptions = JSON.stringify({
-      playerCount: options.playerCount || 4,
+      playerCount: targetPlayerCount,
       isPrivate: options.isPrivate || false,
       roomCode: options.roomCode || null
     });
@@ -66,6 +70,22 @@ export class RegicideRoom extends Room {
 
   onJoin (client, options) {
     console.log(client.sessionId, "joined RegicideRoom!");
+    
+    // Récupérer les options du jeu
+    const gameOptions = JSON.parse(this.state.gameOptions);
+    const targetPlayerCount = gameOptions.playerCount;
+    
+    // Bloquer l'entrée si la partie a déjà le nombre cible de joueurs
+    if (this.state.players.length >= targetPlayerCount) {
+      console.log(`Room full: ${this.state.players.length}/${targetPlayerCount} players`);
+      throw new Error("La partie est complète");
+    }
+    
+    // Bloquer l'entrée si la partie n'est pas en phase d'attente
+    if (this.state.phase !== GAME_PHASES.WAITING) {
+      console.log(`Cannot join: game is in ${this.state.phase} phase`);
+      throw new Error("La partie a déjà commencé ou est terminée");
+    }
     
     // Créer le joueur
     const player = new Player();
