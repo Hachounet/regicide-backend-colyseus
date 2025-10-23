@@ -40,8 +40,8 @@ export function distributeSecretKings(room, kings) {
 export function startDraftPhase(room) {
   console.log("Starting draft phase...");
   const playerCount = room.state.players.length;
-  const cardsPerPack = 4;
-  const totalCardsNeeded = playerCount === 3 ? 12 * 3 : 12 * 4;
+  const cardsPerPack = playerCount === 3 ? 3 : 4; // 3 cartes pour 3 joueurs, 4 pour 4 joueurs
+  const totalCardsNeeded = playerCount === 3 ? 16 * 3 : 12 * 4; // 16 cartes pour 3 joueurs, 12 pour 4 joueurs
   const packsPerRound = playerCount;
   const totalRounds = Math.ceil(totalCardsNeeded / (packsPerRound * cardsPerPack));
   // Expose total rounds and current round for clients
@@ -53,14 +53,15 @@ export function startDraftPhase(room) {
   room.broadcast("draft_started", {
     round: room.draftRound,
     cardsPerPack: cardsPerPack,
-    pickCount: playerCount === 3 ? 2 : 1,
+    pickCount: 1, // Toujours 1 carte à choisir
     totalRounds: totalRounds
   });
 }
 
 export function createDraftPacks(room) {
   const playerCount = room.state.players.length;
-  const cardsPerPack = 4;
+  const cardsPerPack = playerCount === 3 ? 3 : 4; // 3 cartes pour 3 joueurs, 4 pour 4 joueurs
+  
   room.draftPacks = [];
   for (let i = 0; i < playerCount; i++) {
     const pack = [];
@@ -86,8 +87,35 @@ export function distributeDraftPacks(room) {
   });
   room.broadcast("draft_pack_received", {
     round: room.draftRound,
-    pickCount: room.state.players.length === 3 ? 2 : 1
+    pickCount: 1 // Toujours 1 carte à choisir
   });
+}
+
+export function handleLastDraftRound(room) {
+  console.log("Handling last draft round for 3 players - automatic distribution");
+  
+  // Mélanger les 3 cartes restantes
+  const lastCards = CardService.shuffleDeck([...room.draftCards]);
+  
+  // Distribuer automatiquement 1 carte à chaque joueur
+  room.state.players.forEach((player, index) => {
+    if (lastCards[index]) {
+      player.hand.push(lastCards[index]);
+      player.handCount = player.hand.length;
+      console.log(`${player.pseudo} automatically received last card: ${lastCards[index].value} of ${lastCards[index].suit}`);
+    }
+  });
+  
+  // Vider le deck
+  room.draftCards = [];
+  
+  // Notifier les joueurs que le dernier tour est automatique
+  room.broadcast("last_draft_round_complete", {
+    message: "Dernier tour : chaque joueur a reçu 1 carte automatiquement"
+  });
+  
+  // Finaliser le draft immédiatement
+  finalizeDraft(room);
 }
 
 export function handleDraftCards(room, client, message) {
@@ -110,7 +138,7 @@ export function handleDraftCards(room, client, message) {
     return;
   }
   const playerCount = room.state.players.length;
-  const isFirstPick = player.draftPack.length === 4;
+  const isFirstPick = player.draftPack.length === 4 || player.draftPack.length === 3;
   const expectedPickCount = getExpectedPickCount(playerCount, isFirstPick);
   if (message.cardIds.length !== expectedPickCount) {
     client.send("error", { code: "WRONG_PICK_COUNT", message: `Vous devez choisir exactement ${expectedPickCount} carte(s)` });
@@ -130,11 +158,8 @@ export function handleDraftCards(room, client, message) {
 }
 
 export function getExpectedPickCount(playerCount, isFirstPick) {
-  if (playerCount === 3) {
-    return isFirstPick ? 2 : 1;
-  } else {
-    return 1;
-  }
+  // Toujours 1 carte à choisir, quel que soit le nombre de joueurs
+  return 1;
 }
 
 export function processDraftSelection(room, player, selectedCards, playerPack) {
@@ -208,7 +233,7 @@ export function redistributeRemainingCards(room) {
         nextClient.send("draft_pack_received", {
           round: room.draftRound,
           cardsCount: remainingCards.length,
-          pickCount: getExpectedPickCount(room.state.players.length, remainingCards.length === 4)
+          pickCount: 1 // Toujours 1 carte
         });
       }
     }
@@ -240,7 +265,7 @@ export function passDraftPack(room, fromPlayer, remainingCards) {
     nextClient.send("draft_pack_received", {
       round: room.draftRound,
       cardsCount: remainingCards.length,
-      pickCount: getExpectedPickCount(room.state.players.length, remainingCards.length === 4)
+      pickCount: 1 // Toujours 1 carte
     });
   }
 }
@@ -266,6 +291,15 @@ export function completeDraftRound(room) {
     player.draftPack.splice(0, player.draftPack.length);
   });
   room.pendingRemainingCards.clear();
+  
+  // Pour 3 joueurs : vérifier s'il reste exactement 3 cartes pour le dernier tour
+  const playerCount = room.state.players.length;
+  if (playerCount === 3 && room.draftCards.length === 3) {
+    console.log("Last draft round detected - 3 cards remaining");
+    handleLastDraftRound(room);
+    return;
+  }
+  
   if (isDraftComplete(room)) {
     finalizeDraft(room);
   } else {
@@ -275,16 +309,23 @@ export function completeDraftRound(room) {
 
 export function isDraftComplete(room) {
   const playerCount = room.state.players.length;
-  const targetHandSize = 13;
+  // 3 joueurs : 16 cartes draftées + 1 Roi = 17 cartes
+  // 4 joueurs : 12 cartes draftées + 1 Roi = 13 cartes
+  const targetHandSize = playerCount === 3 ? 17 : 13;
+  
   console.log(`Draft completion check:`);
   room.state.players.forEach(player => {
     console.log(`  ${player.pseudo}: ${player.hand.length} cards (target: ${targetHandSize})`);
   });
   console.log(`  Cards remaining in deck: ${room.draftCards.length}`);
+  
   const allPlayersHaveEnoughCards = room.state.players.every(player => player.hand.length >= targetHandSize);
-  const noMoreCards = room.draftCards.length < (playerCount * 4);
+  const cardsPerPack = playerCount === 3 ? 3 : 4;
+  const noMoreCards = room.draftCards.length < (playerCount * cardsPerPack);
+  
   console.log(`  All players have enough cards: ${allPlayersHaveEnoughCards}`);
   console.log(`  No more cards for complete packs: ${noMoreCards}`);
+  
   return allPlayersHaveEnoughCards || noMoreCards;
 }
 
@@ -296,10 +337,29 @@ export function startNextDraftRound(room) {
 }
 
 export function finalizeDraft(room) {
-  console.log("Draft phase complete! All players have their full hands...");
+  console.log("Draft phase complete! Verifying final hand counts...");
+  
+  const playerCount = room.state.players.length;
+  const expectedHandSize = playerCount === 3 ? 17 : 13;
+  
+  // Vérifier que chaque joueur a le bon nombre de cartes
+  let allPlayersValid = true;
   room.state.players.forEach(player => {
-    console.log(`${player.pseudo} final hand: ${player.hand.length} cards (including secret king)`);
+    const actualHandSize = player.hand.length;
+    console.log(`${player.pseudo} final hand: ${actualHandSize} cards (expected: ${expectedHandSize})`);
+    
+    if (actualHandSize !== expectedHandSize) {
+      console.error(`⚠️ WARNING: ${player.pseudo} has ${actualHandSize} cards instead of ${expectedHandSize}!`);
+      allPlayersValid = false;
+    }
   });
+  
+  if (!allPlayersValid) {
+    console.error("⚠️ Draft completed with incorrect hand sizes!");
+  } else {
+    console.log("✓ All players have the correct number of cards");
+  }
+  
   room.state.phase = GAME_PHASES.PLAYING;
   room.state.currentPlayerIndex = 0;
   room.state.discardPile = new ArraySchema();
@@ -312,8 +372,10 @@ export function finalizeDraft(room) {
 
 export function skipToPlayingPhase(room) {
   console.log("DEBUG MODE: Skipping to playing phase with random hands");
+  const playerCount = room.state.players.length;
+  const cardsToAdd = playerCount === 3 ? 16 : 12; // 16 pour 3 joueurs, 12 pour 4 joueurs
+  
   room.state.players.forEach(player => {
-    const cardsToAdd = 12;
     for (let i = 0; i < cardsToAdd && room.draftCards.length > 0; i++) {
       const randomIndex = Math.floor(Math.random() * room.draftCards.length);
       const card = room.draftCards.splice(randomIndex, 1)[0];
