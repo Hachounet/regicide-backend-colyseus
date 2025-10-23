@@ -87,9 +87,20 @@ export function canPlaceCardAt(room, card, row, col) {
   const rightSupportCol = col + 1;
   const leftSupport = getCardAt(room, row - 1, leftSupportCol);
   const rightSupport = getCardAt(room, row - 1, rightSupportCol);
+  
+  // Les deux supports doivent être présents et non vides
+  const bothSupportsExist = 
+    leftSupport && !leftSupport.isEmpty && 
+    rightSupport && !rightSupport.isEmpty;
+  
+  if (!bothSupportsExist) {
+    return false;
+  }
+  
+  // Au moins un des deux supports doit être de la même couleur que la carte
   const hasValidSupport =
-    (leftSupport && !leftSupport.isEmpty && leftSupport.suit === card.suit) ||
-    (rightSupport && !rightSupport.isEmpty && rightSupport.suit === card.suit);
+    leftSupport.suit === card.suit || rightSupport.suit === card.suit;
+  
   return hasValidSupport;
 }
 
