@@ -75,6 +75,30 @@ export class RegicideRoom extends Room {
     const gameOptions = JSON.parse(this.state.gameOptions);
     const targetPlayerCount = gameOptions.playerCount;
     
+    // Vérifier si c'est une reconnexion
+    const existingPlayer = this.state.players.find(p => 
+      p.reconnectionToken && p.reconnectionToken === options.reconnectionToken
+    );
+    
+    if (existingPlayer) {
+      // RECONNEXION : Restaurer le joueur existant
+      console.log(`Player ${existingPlayer.pseudo} reconnected! (was ${existingPlayer.sessionId}, now ${client.sessionId})`);
+      
+      // Mettre à jour la session
+      existingPlayer.sessionId = client.sessionId;
+      existingPlayer.isConnected = true;
+      
+      // Notifier tous les joueurs de la reconnexion
+      this.broadcast("player_reconnected", {
+        sessionId: client.sessionId,
+        pseudo: existingPlayer.pseudo
+      });
+      
+      return; // Sortir de la fonction, le joueur est déjà dans le state
+    }
+    
+    // NOUVELLE CONNEXION : Créer un nouveau joueur
+    
     // Bloquer l'entrée si la partie a déjà le nombre cible de joueurs
     if (this.state.players.length >= targetPlayerCount) {
       console.log(`Room full: ${this.state.players.length}/${targetPlayerCount} players`);
@@ -97,30 +121,79 @@ export class RegicideRoom extends Room {
     player.handCount = 0;
     player.hasPicked = false;
     player.joinedAt = Date.now();
+    
+    // Générer un token de reconnexion unique
+    player.reconnectionToken = this.generateReconnectionToken();
 
     // Ajouter à l'état
     this.state.players.push(player);
     this.state.lastActivity = Date.now();
+    
+    // Envoyer le token au client pour qu'il puisse se reconnecter plus tard
+    client.send("reconnection_token", { token: player.reconnectionToken });
 
     // Vérifier si on peut démarrer la partie
     this.checkGameStart();
   }
 
-  onLeave (client, consented) {
-    console.log(client.sessionId, "left RegicideRoom!");
+  async onLeave (client, consented) {
+    console.log(client.sessionId, "left RegicideRoom!", consented ? "(consented)" : "(timeout/disconnect)");
     
     const playerIndex = this.state.players.findIndex(p => p.sessionId === client.sessionId);
     if (playerIndex !== -1) {
+      const player = this.state.players[playerIndex];
+      
       if (this.state.phase === GAME_PHASES.WAITING) {
-        // En attente : retirer le joueur (ready ou non)
-        this.state.players.splice(playerIndex, 1);
-        this.state.lastActivity = Date.now();
-        // On peut accepter un nouveau joueur à la place
+        // En phase d'attente : si le joueur part volontairement, le retirer
+        if (consented) {
+          this.state.players.splice(playerIndex, 1);
+          this.state.lastActivity = Date.now();
+          console.log(`Player ${player.pseudo} left voluntarily during WAITING phase - removed from room`);
+        } else {
+          // Déconnexion non volontaire : permettre la reconnexion pendant 60 secondes
+          player.isConnected = false;
+          console.log(`Player ${player.pseudo} disconnected during WAITING - allowing reconnection for 60s`);
+          
+          try {
+            await this.allowReconnection(client, 60);
+            // Le joueur s'est reconnecté !
+            console.log(`Player ${player.pseudo} successfully reconnected during WAITING`);
+          } catch (e) {
+            // Timeout de reconnexion : retirer le joueur
+            console.log(`Player ${player.pseudo} did not reconnect in time - removing from room`);
+            const currentIndex = this.state.players.findIndex(p => p.reconnectionToken === player.reconnectionToken);
+            if (currentIndex !== -1) {
+              this.state.players.splice(currentIndex, 1);
+            }
+          }
+        }
       } else {
-        // En jeu : marquer comme déconnecté
-        this.state.players[playerIndex].isConnected = false;
-        // Vérifier si la partie peut continuer
-        this.checkGameContinuation();
+        // En jeu (DRAFTING, PLAYING, ou FINISHED) : toujours permettre la reconnexion
+        player.isConnected = false;
+        console.log(`Player ${player.pseudo} disconnected during ${this.state.phase} - allowing reconnection for 120s`);
+        
+        // Notifier les autres joueurs
+        this.broadcast("player_disconnected", {
+          sessionId: client.sessionId,
+          pseudo: player.pseudo,
+          phase: this.state.phase
+        }, { except: client });
+        
+        try {
+          // Permettre la reconnexion pendant 2 minutes pour les parties en cours
+          await this.allowReconnection(client, 120);
+          // Le joueur s'est reconnecté !
+          console.log(`Player ${player.pseudo} successfully reconnected during ${this.state.phase}`);
+        } catch (e) {
+          // Timeout de reconnexion
+          console.log(`Player ${player.pseudo} did not reconnect in time during ${this.state.phase}`);
+          
+          // Vérifier si la partie peut continuer
+          if (this.state.phase === GAME_PHASES.PLAYING) {
+            this.checkGameContinuation();
+          }
+          // En DRAFTING ou FINISHED, on laisse le joueur dans l'état mais déconnecté
+        }
       }
     }
   }
@@ -259,6 +332,11 @@ export class RegicideRoom extends Room {
   // ==========================================
   // HELPERS
   // ==========================================
+
+  generateReconnectionToken() {
+    // Générer un token unique pour la reconnexion
+    return `${Date.now()}_${Math.random().toString(36).substring(2, 15)}`;
+  }
 
   getPlayerPseudo(sessionId) {
     const player = this.state.players.find(p => p.sessionId === sessionId);

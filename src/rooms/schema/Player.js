@@ -15,6 +15,7 @@ export class Player extends Schema {
     this.isConnected = true;
     this.handCount = 0;
     this.hasPicked = false;
+    this.reconnectionToken = "";
 
     // sessionId, pseudo, secretKing seront définis au moment opportun
   }
@@ -31,4 +32,5 @@ defineTypes(Player, {
   handCount: "number",
   draftPack: [Card],
   hasPicked: "boolean",
+  reconnectionToken: "string",
 });
