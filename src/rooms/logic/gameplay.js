@@ -116,9 +116,17 @@ export function handleReplaceCard(room, card, target, player) {
     player.sessionId && room.clients.find(c => c.sessionId === player.sessionId)?.send("error", { code: "NO_CARD_TO_REPLACE", message: "Aucune carte à remplacer à cette position" });
     return false;
   }
-  if (row === 1 && card.value < existingCard.value) {
-    player.sessionId && room.clients.find(c => c.sessionId === player.sessionId)?.send("error", { code: "CANNOT_REPLACE_CARD", message: "La valeur doit être égale ou supérieure pour remplacer sur la base" });
-    return false;
+  if (row === 1) {
+    if (card.type === CARD_TYPES.ACE) {
+      // L'As ne peut remplacer que Valet, Dame ou Roi
+      if (![CARD_TYPES.JACK, CARD_TYPES.QUEEN, CARD_TYPES.KING].includes(existingCard.type)) {
+        player.sessionId && room.clients.find(c => c.sessionId === player.sessionId)?.send("error", { code: "CANNOT_REPLACE_CARD", message: "L'As ne peut remplacer que Valet, Dame ou Roi sur la base" });
+        return false;
+      }
+    } else if (card.value < existingCard.value) {
+      player.sessionId && room.clients.find(c => c.sessionId === player.sessionId)?.send("error", { code: "CANNOT_REPLACE_CARD", message: "La valeur doit être égale ou supérieure pour remplacer sur la base" });
+      return false;
+    }
   }
   if (row > 1 && !CardService.canReplaceCard(card, existingCard)) {
     player.sessionId && room.clients.find(c => c.sessionId === player.sessionId)?.send("error", { code: "CANNOT_REPLACE_CARD", message: "Cette carte ne peut pas remplacer la carte existante" });
