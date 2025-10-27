@@ -22,6 +22,9 @@ export default config({
          * Bind your custom express routes here:
          * Read more: https://expressjs.com/en/starter/basic-routing.html
          */
+
+        app.get("/healthz", (_req, res) => res.status(200).send("ok"));
+
         app.get("/hello_world", (req, res) => {
             res.send("It's time to kick ass and chew bubblegum!");
         });
@@ -32,6 +35,10 @@ export default config({
          */
         if (process.env.NODE_ENV !== "production") {
             app.use("/", playground());
+        }
+
+        if (process.env.NODE_ENV === "production") {
+            app.get("/", (_req, res) => res.status(200).send("ok"));
         }
 
         /**
